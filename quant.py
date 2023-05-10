@@ -4,6 +4,8 @@ import torch.nn as nn
 
 
 def quantize(x, scale, zero, maxq):
+    if maxq < 0:
+        return (x > scale / 2).float() * scale + (x < zero / 2).float() * zero
     q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
     return scale * (q - zero)
 
@@ -16,10 +18,11 @@ class Quantizer(nn.Module):
         self.register_buffer('zero', torch.zeros(shape))
 
     def configure(
-            self,
-            bits, perchannel=False, sym=True, 
-            mse=False, norm=2.4, grid=100, maxshrink=.8
-        ):
+        self,
+        bits, perchannel=False, sym=True, 
+        mse=False, norm=2.4, grid=100, maxshrink=.8,
+        trits=False
+    ):
         self.maxq = torch.tensor(2 ** bits - 1)
         self.perchannel = perchannel
         self.sym = sym
@@ -27,6 +30,8 @@ class Quantizer(nn.Module):
         self.norm = norm
         self.grid = grid
         self.maxshrink = maxshrink 
+        if trits:
+            self.maxq = torch.tensor(-1) 
 
     def find_params(self, x, weight=False):
         dev = x.device
@@ -60,11 +65,15 @@ class Quantizer(nn.Module):
         xmin[tmp] = -1
         xmax[tmp] = +1
 
-        self.scale = (xmax - xmin) / self.maxq
-        if self.sym:
-            self.zero = torch.full_like(self.scale, (self.maxq + 1) / 2)
+        if self.maxq < 0:
+          self.scale = xmax
+          self.zero = xmin
         else:
-            self.zero = torch.round(-xmin / self.scale)
+          self.scale = (xmax - xmin) / self.maxq
+          if self.sym:
+              self.zero = torch.full_like(self.scale, (self.maxq + 1) / 2)
+          else:
+              self.zero = torch.round(-xmin / self.scale)
 
         if self.mse:
             best = torch.full([x.shape[0]], float('inf'), device=dev)
@@ -127,14 +136,15 @@ except:
 # Assumes layer is perfectly divisible into 1024 * 1024 blocks
 class Quant3Linear(nn.Module): 
 
-    def __init__(self, infeatures, outfeatures):
+    def __init__(self, infeatures, outfeatures, faster=False):
         super().__init__()
         self.register_buffer('zeros', torch.zeros((outfeatures, 1)))
         self.register_buffer('scales', torch.zeros((outfeatures, 1)))
         self.register_buffer('bias', torch.zeros(outfeatures))
         self.register_buffer(
-            'qweight', torch.zeros((infeatures // 1024 * 96, outfeatures), dtype=torch.int)
+            'qweight', torch.zeros((infeatures // 32 * 3, outfeatures), dtype=torch.int)
         )
+        self.faster = faster
 
     def pack(self, linear, scales, zeros):
         self.zeros = zeros * scales
@@ -145,7 +155,7 @@ class Quant3Linear(nn.Module):
         intweight = intweight.t().contiguous()
         intweight = intweight.numpy().astype(np.uint32)
         qweight = np.zeros(
-            (intweight.shape[0] // 1024 * 96, intweight.shape[1]), dtype=np.uint32
+            (intweight.shape[0] // 32 * 3, intweight.shape[1]), dtype=np.uint32
         )
         i = 0
         row = 0
@@ -178,13 +188,17 @@ class Quant3Linear(nn.Module):
             y = self.bias.clone()
             outshape[-1] = self.bias.numel()
             dtype = x.dtype
-            x = x.float()
-            quant_cuda.vecquant3matmul(x, self.qweight, y, self.scales, self.zeros)
+            if self.faster:
+                x = x.half()
+                quant_cuda.vecquant3matmul_faster(x, self.qweight, y, self.scales, self.zeros)
+            else:
+                x = x.float()
+                quant_cuda.vecquant3matmul(x, self.qweight, y, self.scales, self.zeros)
             y = y.to(dtype)
             return y.reshape(outshape)
         raise ValueError('Only supports a single token currently.')
 
-def make_quant3(module, names, name=''):
+def make_quant3(module, names, name='', faster=False):
     if isinstance(module, Quant3Linear):
         return
     for attr in dir(module):
@@ -192,7 +206,7 @@ def make_quant3(module, names, name=''):
         name1 = name + '.' + attr if name != '' else attr
         if name1 in names:
             setattr(
-                module, attr, Quant3Linear(tmp.in_features, tmp.out_features)
+                module, attr, Quant3Linear(tmp.in_features, tmp.out_features, faster=faster)
             )
     for name1, child in module.named_children():
-        make_quant3(child, names, name + '.' + name1 if name != '' else name1)
+        make_quant3(child, names, name + '.' + name1 if name != '' else name1, faster=faster)

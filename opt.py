@@ -83,7 +83,7 @@ def opt_sequential(model, dataloader, dev):
             gptq[name] = GPTQ(subset[name])
             gptq[name].quantizer = Quantizer()
             gptq[name].quantizer.configure(
-                args.wbits, perchannel=True, sym=False, mse=False
+                args.wbits, perchannel=True, sym=args.sym, mse=False, trits=args.trits
             )
 
         def add_batch(name):
@@ -101,7 +101,7 @@ def opt_sequential(model, dataloader, dev):
         for name in subset:
             print(i, name)
             print('Quantizing ...')
-            gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize)
+            gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order)
             quantizers['model.decoder.layers.%d.%s' % (i, name)] = gptq[name].quantizer
             gptq[name].free()
         for j in range(args.nsamples):
@@ -182,7 +182,7 @@ def opt_eval(model, testenc, dev):
             for name in subset:
                 quantizer = Quantizer()
                 quantizer.configure(
-                    args.wbits, perchannel=True, sym=False, mse=False
+                    args.wbits, perchannel=True, sym=args.sym, mse=False
                 )
                 W = subset[name].weight.data
                 quantizer.find_params(W, weight=True)
@@ -229,7 +229,7 @@ def opt_eval(model, testenc, dev):
 def opt_pack3(model, quantizers):
     layers = find_layers(model)
     layers = {n: layers[n] for n in quantizers}
-    make_quant3(model, quantizers)
+    make_quant3(model, quantizers, faster=args.faster_kernel)
     qlayers = find_layers(model, [Quant3Linear])
     print('Packing ...')
     for name in qlayers:
@@ -258,7 +258,7 @@ def load_quant3(model, checkpoint):
     for name in ['model.decoder.project_out', 'model.decoder.project_in', 'lm_head']:
         if name in layers:
             del layers[name]
-    make_quant3(model, layers)
+    make_quant3(model, layers, faster=args.faster_kernel)
 
     print('Loading model ...')
     model.load_state_dict(torch.load(checkpoint))
@@ -387,8 +387,16 @@ if __name__ == '__main__':
         help='#bits to use for quantization; use 16 for evaluating base model.'
     )
     parser.add_argument(
+        '--trits', action='store_true',
+        help='Whether to use trits for quantization.'
+    )
+    parser.add_argument(
         '--groupsize', type=int, default=-1,
         help='Groupsize to use for quantization; default uses full row.'
+    )
+    parser.add_argument(
+        '--sym', action='store_true',
+        help='Whether to perform symmetric quantization.'
     )
     parser.add_argument(
         '--save', type=str, default='',
@@ -405,6 +413,18 @@ if __name__ == '__main__':
     parser.add_argument(
         '--check', action='store_true',
         help='Whether to compute perplexity during benchmarking for verification.'
+    )
+    parser.add_argument(
+        '--new-eval', action='store_true',
+        help='Whether to use the new PTB and C4 eval.'
+    )
+    parser.add_argument(
+        '--faster-kernel', action='store_true',
+        help='Whether to use the new faster kernel for benchmarking.'
+    )
+    parser.add_argument(
+        '--act-order', action='store_true',
+        help='Whether to apply the activation order GPTQ heuristic'
     )
 
     args = parser.parse_args()
@@ -436,7 +456,10 @@ if __name__ == '__main__':
     if args.load:
         exit()
 
-    for dataset in ['wikitext2', 'ptb', 'c4']:
+    datasets = ['wikitext2', 'ptb', 'c4'] 
+    if args.new_eval:
+      datasets = ['wikitext2', 'ptb-new', 'c4-new']
+    for dataset in datasets: 
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
