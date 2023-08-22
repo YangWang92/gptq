@@ -108,7 +108,9 @@ def llama_sequential(model, dataloader, dev):
             for name in subset:
                 print(i, name)
                 print('Quantizing ...')
-                gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order)
+                gptq[name].fasterquant(
+                    percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
+                )
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
 
@@ -221,6 +223,19 @@ def llama_eval(model, testenc, dev):
 
     model.config.use_cache = use_cache
 
+def llama_pack3(model, quantizers):
+    layers = find_layers(model)
+    layers = {n: layers[n] for n in quantizers}
+    make_quant3(model, quantizers)
+    qlayers = find_layers(model, [Quant3Linear])
+    print('Packing ...')
+    for name in qlayers:
+        print(name)
+        quantizers[name] = quantizers[name].cpu()
+        qlayers[name].pack(layers[name], quantizers[name].scale, quantizers[name].zero)
+    print('Done.')
+    return model
+
 
 if __name__ == '__main__':
     import argparse
@@ -265,6 +280,10 @@ if __name__ == '__main__':
         help='Whether to perform symmetric quantization.'
     )
     parser.add_argument(
+        '--save', type=str, default='',
+        help='Save quantized checkpoint under this name.'
+    )
+    parser.add_argument(
         '--new-eval', action='store_true',
         help='Whether to use the new PTB and C4 eval.'
     )
@@ -275,6 +294,10 @@ if __name__ == '__main__':
     parser.add_argument(
         '--true-sequential', action='store_true',
         help='Whether to run in true sequential model.'
+    )
+    parser.add_argument(
+        '--static-groups', action='store_true',
+        help='Whether to use static groups; recommended when using `--actorder` for more efficient inference.'
     )
 
     args = parser.parse_args()
@@ -293,10 +316,15 @@ if __name__ == '__main__':
 
     datasets = ['wikitext2', 'ptb', 'c4'] 
     if args.new_eval:
-      datasets = ['wikitext2', 'ptb-new', 'c4-new']
+        datasets = ['wikitext2', 'ptb-new', 'c4-new']
     for dataset in datasets:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
         print(dataset)
         llama_eval(model, testloader, DEV)
+
+    if args.save:
+        llama_pack3(model, quantizers)
+        torch.save(model.state_dict(), args.save)
+
